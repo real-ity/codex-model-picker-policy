@@ -1,0 +1,11 @@
+{
+  "fetched_at": "2026-07-30T12:00:00Z",
+  "client_version": "test",
+  "models": [
+    {"slug": "gpt-5.6-sol", "visibility": "list", "description": "normal"},
+    {"slug": "deepseek/deepseek-v4-pro", "visibility": "list", "description": "blocked"},
+    {"slug": "Unsloth/GLM-4.7-Flash-GUFF", "visibility": "list", "description": "blocked, mixed case"},
+    {"slug": "codex-auto-review", "visibility": "hide", "description": "special model"},
+    {"slug": "gpt-image-1", "visibility": "hide", "description": "image model"}
+  ]
+}

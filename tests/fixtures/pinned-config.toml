@@ -1,0 +1,8 @@
+model = "example-chat-model"
+model_catalog_json = "/old/pinned/catalog.json"
+
+[model_providers.example]
+name = "Example provider"
+base_url = "https://proxy.invalid/v1"
+env_key = "EXAMPLE_PROXY_KEY"
+wire_api = "responses"

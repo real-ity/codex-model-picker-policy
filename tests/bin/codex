@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+if [ "${1-}" = "debug" ] && [ "${2-}" = "models" ]; then
+  if [ "${CODEX_POLICY_REQUIRE_UNPINNED-}" = 1 ] &&
+    grep -E '^[[:space:]]*model_catalog_json[[:space:]]*=' "$CODEX_HOME/config.toml" >/dev/null 2>&1; then
+    printf '%s\n' 'fake codex received a still-pinned discovery config' >&2
+    exit 65
+  fi
+  if grep -E '^[[:space:]]*model_catalog_json[[:space:]]*=' "$CODEX_HOME/config.toml" >/dev/null 2>&1 &&
+    [ -f "$CODEX_HOME/model-catalog.json" ]; then
+    exec jq . "$CODEX_HOME/model-catalog.json"
+  fi
+  exec jq . "$CODEX_POLICY_TEST_ROOT/tests/fixtures/live-catalog.json"
+fi
+
+if [ "${1-}" = "--version" ]; then
+  printf '%s\n' 'codex-cli test'
+  exit 0
+fi
+
+printf '%s\n' "unexpected fake codex arguments: $*" >&2
+exit 64

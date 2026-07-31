@@ -1,0 +1,288 @@
+#!/bin/sh
+set -eu
+umask 077
+
+program=${0##*/}
+managed_marker='# managed by codex-model-picker-policy'
+work_tmp=
+atomic_tmp=
+
+cleanup() {
+  if [ -n "$atomic_tmp" ] && [ -f "$atomic_tmp" ]; then
+    rm -f -- "$atomic_tmp"
+  fi
+  if [ -n "$work_tmp" ] && [ -d "$work_tmp" ]; then
+    rm -rf -- "$work_tmp"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+die() {
+  printf '%s: %s\n' "$program" "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+codex_home=${CODEX_HOME:-"$HOME/.codex"}
+config_file=$codex_home/config.toml
+catalog_file=$codex_home/model-catalog.json
+
+prepare_work_dir() {
+  [ -n "$work_tmp" ] && return
+  work_tmp=$(mktemp -d "${TMPDIR:-/tmp}/codex-model-picker-policy.XXXXXX") ||
+    die 'could not create a temporary directory'
+  chmod 700 "$work_tmp"
+}
+
+write_discovery_config() {
+  discovery_home=$1
+  [ -f "$config_file" ] || return 0
+
+  awk '
+    BEGIN { in_root = 1 }
+    in_root && /^[[:space:]]*\[/ { in_root = 0 }
+    in_root && /^[[:space:]]*model_catalog_json[[:space:]]*=/ { next }
+    { print }
+  ' "$config_file" >"$discovery_home/config.toml"
+  chmod 600 "$discovery_home/config.toml"
+}
+
+discover_live_catalog() {
+  output_file=$1
+  prepare_work_dir
+  discovery_home=$work_tmp/discovery-home
+  mkdir -p "$discovery_home"
+  chmod 700 "$discovery_home"
+  write_discovery_config "$discovery_home"
+
+  if [ -f "$codex_home/auth.json" ]; then
+    ln -s "$codex_home/auth.json" "$discovery_home/auth.json"
+  fi
+
+  if ! (cd "$discovery_home" && CODEX_HOME="$discovery_home" codex debug models) >"$output_file"; then
+    die 'codex debug models failed while discovering the live catalog'
+  fi
+}
+
+refresh_catalog() {
+  require_command codex
+  require_command jq
+  mkdir -p "$codex_home"
+  prepare_work_dir
+  raw_catalog=$work_tmp/live-catalog.json
+  transformed_catalog=$work_tmp/model-catalog.json
+
+  discover_live_catalog "$raw_catalog"
+  jq -e 'type == "object" and (.models | type == "array") and all(.models[]; (.slug | type == "string"))' \
+    "$raw_catalog" >/dev/null || die 'codex returned an invalid model catalog'
+
+  jq '
+    .models |= map(
+      .visibility = (
+        if ((.slug | ascii_downcase | contains("glm")) or
+            (.slug | ascii_downcase | contains("deepseek")))
+        then "hide"
+        else "list"
+        end
+      )
+    )
+  ' "$raw_catalog" >"$transformed_catalog"
+
+  atomic_tmp=$(mktemp "$codex_home/.model-catalog.json.tmp.XXXXXX") ||
+    die 'could not create a temporary catalog beside the destination'
+  chmod 600 "$atomic_tmp"
+  cp "$transformed_catalog" "$atomic_tmp"
+  mv -f "$atomic_tmp" "$catalog_file"
+  atomic_tmp=
+}
+
+validate_and_report_catalog() {
+  file=$1
+  label=$2
+  [ -f "$file" ] || die "$label does not exist: $file"
+
+  if ! jq -e '
+    type == "object" and
+    (.models | type == "array") and
+    all(.models[];
+      (.slug | type == "string") and
+      (.visibility == (
+        if ((.slug | ascii_downcase | contains("glm")) or
+            (.slug | ascii_downcase | contains("deepseek")))
+        then "hide"
+        else "list"
+        end
+      ))
+    )
+  ' "$file" >/dev/null; then
+    die "$label violates the visibility policy"
+  fi
+
+  counts=$(jq -r '[
+    (.models | length),
+    ([.models[] | select(.visibility == "list")] | length),
+    ([.models[] | select(.visibility == "hide")] | length)
+  ] | map(tostring) | join(" ")' "$file")
+  set -- $counts
+  printf '%s: total=%s visible=%s hidden=%s\n' "$label" "$1" "$2" "$3"
+}
+
+verify_binary_catalog() {
+  binary=$1
+  label=$2
+  prepare_work_dir
+  binary_catalog=$work_tmp/verified-catalog.$$
+  if ! (cd "$codex_home" && CODEX_HOME="$codex_home" "$binary" debug models) >"$binary_catalog"; then
+    die "$label failed to render its model catalog"
+  fi
+  validate_and_report_catalog "$binary_catalog" "$label"
+}
+
+verify_macos_app_binaries() {
+  [ "$(uname -s)" = Darwin ] || return 0
+  prepare_work_dir
+  app_binaries=$work_tmp/macos-app-binaries
+  : >"$app_binaries"
+
+  for applications_dir in /Applications "$HOME/Applications"; do
+    [ -d "$applications_dir" ] || continue
+    for app_bundle in "$applications_dir"/*Codex*.app "$applications_dir"/*ChatGPT*.app; do
+      [ -d "$app_bundle/Contents" ] || continue
+      find "$app_bundle/Contents" -type f -name codex -perm -111 -print 2>/dev/null >>"$app_binaries"
+    done
+  done
+
+  sort -u "$app_binaries" -o "$app_binaries"
+  while IFS= read -r app_binary; do
+    [ -n "$app_binary" ] || continue
+    verify_binary_catalog "$app_binary" "desktop app ($app_binary)"
+  done <"$app_binaries"
+}
+
+check_policy() {
+  require_command codex
+  require_command jq
+  validate_and_report_catalog "$catalog_file" 'managed catalog'
+  verify_binary_catalog "$(command -v codex)" 'codex CLI'
+  verify_macos_app_binaries
+}
+
+remove_override() {
+  if [ ! -f "$config_file" ]; then
+    printf '%s\n' "No configuration file found; nothing to remove: $config_file"
+    return
+  fi
+
+  prepare_work_dir
+  new_config=$work_tmp/config.without-managed-override.toml
+  awk -v marker="$managed_marker" '
+    BEGIN { in_root = 1 }
+    in_root && /^[[:space:]]*\[/ { in_root = 0 }
+    in_root && /^[[:space:]]*model_catalog_json[[:space:]]*=/ && index($0, marker) { next }
+    { print }
+  ' "$config_file" >"$new_config"
+
+  if cmp -s "$config_file" "$new_config"; then
+    printf '%s\n' "No managed override found; configuration unchanged: $config_file"
+    return
+  fi
+
+  backup_file=$config_file.bak.$(date +%Y%m%d%H%M%S).$$
+  cp -p "$config_file" "$backup_file"
+  atomic_tmp=$(mktemp "$codex_home/.config.toml.tmp.XXXXXX") ||
+    die 'could not create a temporary config beside the destination'
+  chmod 600 "$atomic_tmp"
+  cp "$new_config" "$atomic_tmp"
+  mv -f "$atomic_tmp" "$config_file"
+  atomic_tmp=
+  printf '%s\n' "Removed managed override; retained catalog: $catalog_file"
+}
+
+install_override() {
+  refresh_catalog
+  mkdir -p "$codex_home"
+
+  path_literal=$(jq -Rn --arg value "$catalog_file" '$value')
+  managed_line="model_catalog_json = $path_literal $managed_marker"
+  prepare_work_dir
+  new_config=$work_tmp/config.toml
+
+  if [ -f "$config_file" ]; then
+    awk -v replacement="$managed_line" '
+      BEGIN { in_root = 1; installed = 0 }
+      in_root && /^[[:space:]]*\[/ {
+        if (!installed) {
+          print replacement
+          print ""
+          installed = 1
+        }
+        in_root = 0
+      }
+      in_root && /^[[:space:]]*model_catalog_json[[:space:]]*=/ {
+        if (!installed) {
+          print replacement
+          installed = 1
+        }
+        next
+      }
+      { print }
+      END {
+        if (!installed) {
+          if (NR > 0) print ""
+          print replacement
+        }
+      }
+    ' "$config_file" >"$new_config"
+  else
+    printf '%s\n' "$managed_line" >"$new_config"
+  fi
+
+  if [ -f "$config_file" ] && cmp -s "$config_file" "$new_config"; then
+    printf '%s\n' "Installed policy; configuration already current: $config_file"
+    return
+  fi
+
+  if [ -f "$config_file" ]; then
+    backup_file=$config_file.bak.$(date +%Y%m%d%H%M%S).$$
+    cp -p "$config_file" "$backup_file"
+  fi
+
+  atomic_tmp=$(mktemp "$codex_home/.config.toml.tmp.XXXXXX") ||
+    die 'could not create a temporary config beside the destination'
+  chmod 600 "$atomic_tmp"
+  cp "$new_config" "$atomic_tmp"
+  mv -f "$atomic_tmp" "$config_file"
+  atomic_tmp=
+  printf '%s\n' "Installed model-picker policy in $config_file"
+}
+
+usage() {
+  printf 'Usage: %s {install|refresh|check|remove}\n' "$program"
+}
+
+case ${1-} in
+  install)
+    [ "$#" -eq 1 ] || die 'install takes no arguments'
+    install_override
+    ;;
+  refresh)
+    [ "$#" -eq 1 ] || die 'refresh takes no arguments'
+    refresh_catalog
+    printf '%s\n' "Refreshed model catalog: $catalog_file"
+    ;;
+  check)
+    [ "$#" -eq 1 ] || die 'check takes no arguments'
+    check_policy
+    ;;
+  remove)
+    [ "$#" -eq 1 ] || die 'remove takes no arguments'
+    remove_override
+    ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac
