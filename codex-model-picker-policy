@@ -83,7 +83,8 @@ refresh_catalog() {
     .models |= map(
       .visibility = (
         if ((.slug | ascii_downcase | contains("glm")) or
-            (.slug | ascii_downcase | contains("deepseek")))
+            (.slug | ascii_downcase | contains("deepseek")) or
+            (.slug == "codex-auto-review"))
         then "hide"
         else "list"
         end
@@ -111,7 +112,8 @@ validate_and_report_catalog() {
       (.slug | type == "string") and
       (.visibility == (
         if ((.slug | ascii_downcase | contains("glm")) or
-            (.slug | ascii_downcase | contains("deepseek")))
+            (.slug | ascii_downcase | contains("deepseek")) or
+            (.slug == "codex-auto-review"))
         then "hide"
         else "list"
         end

@@ -47,7 +47,7 @@ test_install_preserves_config() {
     fail 'repeated install created a needless config backup'
 }
 
-test_refresh_bypasses_pin_and_applies_literal_policy() {
+test_refresh_bypasses_pin_and_keeps_internal_models_hidden() {
   test_home=$test_tmp/refresh-home
   mkdir -p "$test_home"
   cp "$project_root/tests/fixtures/pinned-config.toml" "$test_home/config.toml"
@@ -66,11 +66,11 @@ test_refresh_bypasses_pin_and_applies_literal_policy() {
       {"slug":"gpt-5.6-sol","visibility":"list"},
       {"slug":"deepseek/deepseek-v4-pro","visibility":"hide"},
       {"slug":"Unsloth/GLM-4.7-Flash-GUFF","visibility":"hide"},
-      {"slug":"codex-auto-review","visibility":"list"},
+      {"slug":"codex-auto-review","visibility":"hide"},
       {"slug":"gpt-image-1","visibility":"list"}
     ]
   ' "$test_home/model-catalog.json" >/dev/null ||
-    fail 'refresh did not apply the literal visibility policy'
+    fail 'refresh did not apply the visibility policy'
 }
 
 test_check_reports_counts_and_rejects_policy_drift() {
@@ -87,7 +87,7 @@ test_check_reports_counts_and_rejects_policy_drift() {
     CODEX_HOME="$test_home" \
     CODEX_POLICY_TEST_ROOT="$project_root" \
     "$project_root/codex-model-picker-policy" check)
-  printf '%s\n' "$check_output" | grep -F 'total=5 visible=3 hidden=2' >/dev/null ||
+  printf '%s\n' "$check_output" | grep -F 'total=5 visible=2 hidden=3' >/dev/null ||
     fail 'check did not report expected totals'
 
   jq '(.models[] | select(.slug == "gpt-5.6-sol")).visibility = "hide"' \
@@ -135,8 +135,8 @@ test_remove_deletes_only_managed_override() {
 
 test_install_preserves_config
 printf '%s\n' 'PASS: install preserves unrelated config'
-test_refresh_bypasses_pin_and_applies_literal_policy
-printf '%s\n' 'PASS: refresh bypasses the pin and applies the literal policy'
+test_refresh_bypasses_pin_and_keeps_internal_models_hidden
+printf '%s\n' 'PASS: refresh bypasses the pin and keeps internal models hidden'
 test_check_reports_counts_and_rejects_policy_drift
 printf '%s\n' 'PASS: check reports counts and rejects policy drift'
 test_remove_deletes_only_managed_override

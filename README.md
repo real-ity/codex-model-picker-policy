@@ -1,8 +1,13 @@
 # Portable Codex model-picker policy
 
 This small POSIX shell utility makes every discovered Codex model picker-visible
-except model IDs containing `glm` or `deepseek`, case-insensitively. That literal
-rule also exposes special entries such as image models and `codex-auto-review`.
+except model IDs containing `glm` or `deepseek`, case-insensitively, and the
+internal `codex-auto-review` model. Image models and other special entries remain
+visible.
+
+`codex-auto-review` stays hidden because Codex uses it internally for automatic
+approval review. Making it picker-visible causes recent Codex CLIs to add a
+separate quick-mode menu before the normal model-and-effort picker.
 
 It generates the catalog on each destination machine instead of copying a catalog
 from another installation. This keeps the result aligned with that machine's Codex
