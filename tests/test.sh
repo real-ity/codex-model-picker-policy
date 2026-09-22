@@ -64,8 +64,8 @@ test_refresh_bypasses_pin_and_keeps_internal_models_hidden() {
   jq -e '
     [.models[] | {slug, visibility}] == [
       {"slug":"gpt-5.6-sol","visibility":"list"},
-      {"slug":"deepseek/deepseek-v4-pro","visibility":"hide"},
-      {"slug":"Unsloth/GLM-4.7-Flash-GUFF","visibility":"hide"},
+      {"slug":"deepseek/deepseek-v4-pro","visibility":"list"},
+      {"slug":"Unsloth/GLM-4.7-Flash-GUFF","visibility":"list"},
       {"slug":"codex-auto-review","visibility":"hide"},
       {"slug":"gpt-image-1","visibility":"list"}
     ]
@@ -87,18 +87,22 @@ test_check_reports_counts_and_rejects_policy_drift() {
     CODEX_HOME="$test_home" \
     CODEX_POLICY_TEST_ROOT="$project_root" \
     "$project_root/codex-model-picker-policy" check)
-  printf '%s\n' "$check_output" | grep -F 'total=5 visible=2 hidden=3' >/dev/null ||
+  printf '%s\n' "$check_output" | grep -F 'total=5 visible=4 hidden=1' >/dev/null ||
     fail 'check did not report expected totals'
 
-  jq '(.models[] | select(.slug == "gpt-5.6-sol")).visibility = "hide"' \
-    "$test_home/model-catalog.json" >"$test_home/drifted.json"
-  mv "$test_home/drifted.json" "$test_home/model-catalog.json"
-  if PATH="$project_root/tests/bin:$PATH" \
-    CODEX_HOME="$test_home" \
-    CODEX_POLICY_TEST_ROOT="$project_root" \
-    "$project_root/codex-model-picker-policy" check >/dev/null 2>&1; then
-    fail 'check accepted a non-GLM/DeepSeek model marked hidden'
-  fi
+  cp "$test_home/model-catalog.json" "$test_home/catalog.before"
+  for slug in gpt-5.6-sol deepseek/deepseek-v4-pro Unsloth/GLM-4.7-Flash-GUFF codex-auto-review; do
+    jq --arg slug "$slug" '
+      (.models[] | select(.slug == $slug)).visibility |=
+        if . == "hide" then "list" else "hide" end
+    ' "$test_home/catalog.before" >"$test_home/model-catalog.json"
+    if PATH="$project_root/tests/bin:$PATH" \
+      CODEX_HOME="$test_home" \
+      CODEX_POLICY_TEST_ROOT="$project_root" \
+      "$project_root/codex-model-picker-policy" check >/dev/null 2>&1; then
+      fail "check accepted incorrect visibility for $slug"
+    fi
+  done
 }
 
 test_remove_deletes_only_managed_override() {
