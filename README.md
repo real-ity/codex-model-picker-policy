@@ -1,93 +1,182 @@
-# Portable Codex model-picker policy
+# Codex model catalog generator
 
-This small POSIX shell utility makes every discovered Codex model picker-visible
-except the internal `codex-auto-review` model. GLM, DeepSeek, image models, and
-other special entries remain visible.
+Make the models advertised by your custom proxy available in Codex's model picker,
+including models that Codex does not already know about.
 
-`codex-auto-review` stays hidden because Codex uses it internally for automatic
-approval review. Making it picker-visible causes recent Codex CLIs to add a
-separate quick-mode menu before the normal model-and-effort picker.
+```sh
+./codex-model-picker-policy
+```
 
-It generates the catalog on each destination machine instead of copying a catalog
-from another installation. This keeps the result aligned with that machine's Codex
-version, account, provider, and available models.
+The script reads Codex's selected provider and credentials from
+`$CODEX_HOME/config.toml` (default: `~/.codex/config.toml`), queries that endpoint,
+and writes `$CODEX_HOME/model-catalog.json`. It does not change your configuration.
+No proxy-specific URL or token needs to be entered again.
 
-## Requirements
+Requires **Python 3.11+** and a **Codex CLI supporting `debug models --bundled`**.
+No Python packages are required. Works on macOS, Linux, and WSL.
 
-- macOS, Linux, or WSL with a POSIX shell
-- `codex` with the `codex debug models` command
-- `jq`
+## Use the generated catalog
 
-The utility honors `CODEX_HOME`; otherwise it uses `$HOME/.codex`, Codex's normal
-user configuration directory. Codex documents `model_catalog_json` as an optional
-startup catalog path in its [configuration reference](https://developers.openai.com/codex/config-reference/).
+To generate the file and configure Codex to use it in one step:
 
-## Install the utility
+```sh
+./codex-model-picker-policy install
+./codex-model-picker-policy check --live
+```
 
-From this directory:
+`install` adds the root `model_catalog_json` setting to the selected configuration
+file, preserves unrelated settings, and backs up changed configuration. Repeating
+it does not create another backup if the setting is unchanged. Restart Codex to
+reload the picker.
+
+To manage that setting yourself, use the generated file's absolute path:
+
+```toml
+model_catalog_json = "/absolute/path/to/model-catalog.json"
+```
+
+The catalog is a snapshot. Rerun the script after adding or removing models from
+your proxy. `generate` and `refresh` are explicit names for the default command.
+
+```sh
+./codex-model-picker-policy generate --dry-run
+./codex-model-picker-policy generate --output ./model-catalog.json
+./codex-model-picker-policy list
+./codex-model-picker-policy list --live --json
+./codex-model-picker-policy remove
+```
+
+`--dry-run` discovers and validates without changing files. `list` shows IDs and
+visibility. `remove` removes only the marked managed setting and retains the file.
+`check` verifies the configuration pointer and that Codex accepts the catalog;
+`check --live` also detects changed IDs and picker visibility at the endpoint.
+On macOS, checks include Codex executables in installed Codex/ChatGPT app bundles.
+
+## Follow the same Codex configuration
+
+If you launch Codex with a profile or configuration overrides, supply the same
+ones here:
+
+```sh
+# Codex: codex --profile work
+./codex-model-picker-policy --profile work
+./codex-model-picker-policy install --profile work
+
+# Codex: codex -c 'model_provider="myproxy"'
+./codex-model-picker-policy -c 'model_provider="myproxy"'
+```
+
+Selection follows user `config.toml`, then `$CODEX_HOME/<name>.config.toml` for
+`--profile`, then `-c`/`--config` overrides. Profile generation writes
+`model-catalog-<name>.json`; profile installation edits only that profile file.
+Legacy inline profiles are rejected with migration guidance, matching current
+[Codex profile configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles).
+
+The script reads user configuration; it does not attach to an existing session
+or load managed/system configuration. Project-local provider settings are not
+used. A session launched with different flags or environment variables can have a
+different connection. Built-in OpenAI endpoint overrides use `openai_base_url` and
+`OPENAI_API_KEY`.
+
+Optional discovery overrides are also available:
+
+```sh
+./codex-model-picker-policy --provider another-proxy
+./codex-model-picker-policy --base-url http://localhost:8317/v1 --api-key-env PROXY_KEY
+./codex-model-picker-policy --timeout 60
+```
+
+These flags do not change Codex's inference provider or persist connection
+settings. `--source proxy` requires an endpoint; `--source codex` explicitly uses
+unpinned Codex discovery. With no custom endpoint, the default `--source auto`
+uses Codex discovery. A configured endpoint's request failure never falls back
+to a bundled inventory.
+
+## Standard model lists and rich catalogs
+
+The endpoint's inventory determines catalog membership. Bundled models are never
+added unless the endpoint advertises them.
+
+- Standard OpenAI-compatible `GET /models` responses (`data[].id`) are supported.
+- If the endpoint also provides Codex metadata via `?client_version=...`, that
+  metadata enriches matching IDs. This preserves CLIProxyAPI's model instructions,
+  reasoning choices, context limits, and other capabilities.
+- Missing rich metadata is filled from an **exact model ID** in the installed
+  Codex bundle, or a generic entry for a new model. No fuzzy alias matching.
+- Endpoints returning a rich `models[].slug` catalog directly are also supported.
+
+An unsupported rich-metadata request or a repeated standard response is normal;
+authentication errors, network failures, and malformed rich responses remain
+errors. Rich-only IDs absent from the standard inventory are ignored. A stale or
+partial rich catalog does not remove extra IDs from the standard inventory.
+
+Generic entries use original generic coding instructions, text input, and no
+advertised reasoning choices or context limit unless the endpoint supplies them.
+They are identified in the generated file's `_model_picker.generic_models` field.
+Unknown context limits also mean no context-derived automatic compaction limit;
+set Codex's `model_context_window` to the provider's documented limit when known.
+Being listed does not prove that a model supports a successful Codex inference turn.
+
+Output order is stable. Before replacement, the script asks the installed Codex
+CLI to load the generated file in an isolated temporary home and verifies model
+IDs and visibility. Files are written atomically with owner-only permissions.
+Empty, duplicate, malformed, and explicitly paginated inventories are rejected
+without replacing the last good catalog. The endpoint must return its full list.
+
+## Picker exclusions
+
+By default, the script shows advertised coding/chat models, including aliases,
+GLM, and DeepSeek. It hides the internal `codex-auto-review` model and clearly
+specialized image-generation, embedding, speech, moderation, realtime, and video
+entries identified by known ID patterns or advertised metadata. Image/audio
+**input** on a coding model does not hide it.
+
+Unknown aliases cannot be classified from IDs alone. Add personal exclusions as
+case-insensitive glob patterns:
+
+```sh
+./codex-model-picker-policy --exclude '*glm*' --exclude '*deepseek*'
+```
+
+Exclusions are saved in the generated file and reused on refresh and checks.
+Providing `--exclude` replaces the saved patterns; `--clear-exclusions` clears
+personal patterns while retaining the general suitability rules.
+
+## Credentials and connectivity
+
+Provider authentication supports `env_key`, `experimental_bearer_token`,
+`http_headers`, and `env_http_headers`. Required missing keys fail before a request;
+optional environment headers are omitted when unset. Provider `query_params` are
+retained on both requests. Certificate configuration honors `CODEX_CA_CERTIFICATE`
+and then `SSL_CERT_FILE`.
+
+Credential helper commands and ChatGPT OAuth credentials for custom endpoints
+are not supported; use `--api-key-env` when needed. Credentials and error response
+bodies are not printed, and redirects are refused. Configuration values and
+credentials are not embedded in the generated catalog.
+
+## Install the executable
 
 ```sh
 mkdir -p "$HOME/.local/bin"
 install -m 755 ./codex-model-picker-policy "$HOME/.local/bin/codex-model-picker-policy"
 ```
 
-Make sure `$HOME/.local/bin` is on `PATH`, then apply the policy:
+Make sure `~/.local/bin` is on `PATH`.
 
-```sh
-codex-model-picker-policy install
-codex-model-picker-policy check
-```
-
-`install` first discovers and validates a live catalog, atomically writes
-`$CODEX_HOME/model-catalog.json`, and then adds or updates this root setting in
-`config.toml`:
-
-```toml
-model_catalog_json = "/absolute/path/to/model-catalog.json" # managed by codex-model-picker-policy
-```
-
-Existing `config.toml` content is preserved. The utility creates a timestamped
-backup before changing it and does not create another backup on an unchanged,
-repeated install.
-
-Restart the Codex app or IDE after installing or refreshing so its model picker
-reloads the startup catalog.
-
-## Commands
-
-```text
-codex-model-picker-policy install
-codex-model-picker-policy refresh
-codex-model-picker-policy check
-codex-model-picker-policy remove
-```
-
-- `install` refreshes the catalog and idempotently applies the config override.
-- `refresh` rediscovers the live catalog and atomically replaces the generated
-  catalog without changing `config.toml`.
-- `check` prints total, visible, and hidden counts and fails unless every model's
-  visibility exactly matches the policy. It checks both the file and the catalog
-  rendered by the CLI. On macOS it also checks executable Codex binaries found in
-  installed Codex or ChatGPT app bundles.
-- `remove` removes only the marked, managed config entry. It retains the generated
-  catalog and leaves an unmarked `model_catalog_json` entry untouched.
-
-## Refresh behavior and secrets
-
-Once configured, `model_catalog_json` pins the startup catalog. To bypass that pin,
-`refresh` creates a mode-700 temporary Codex home, writes a mode-600 temporary copy
-of `config.toml` with only the root `model_catalog_json` entry removed, and links the
-existing `auth.json` when present. It never prints configuration or credential
-values. Cleanup runs on normal exit and common termination signals.
-
-If discovery, JSON validation, or transformation fails, the existing managed
-catalog is left untouched.
-
-## Test
-
-Tests use isolated temporary Codex homes, placeholder-only fixtures, and a fake
-`codex` executable; they never read the real Codex configuration or credentials.
+## Tests
 
 ```sh
 ./tests/test.sh
+
+# Also test the installed Codex against a local standard-only proxy.
+CODEX_POLICY_REAL_CODEX=1 python3 tests/test_real_codex.py
 ```
+
+The main suite additionally requires `jq` for the fake CLI and legacy checks.
+Tests use temporary Codex homes, local HTTP fixtures, and placeholder credentials;
+they do not read your real Codex configuration or contact your proxy.
+
+The single executable keeps connection resolution (`CodexConfiguration`), endpoint
+catalog discovery (`EndpointCatalog`), and picker exclusions separate. Tests
+exercise their behavior through the command interface.

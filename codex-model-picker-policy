@@ -1,286 +1,603 @@
-#!/bin/sh
-set -eu
-umask 077
+#!/usr/bin/env python3
+"""Keep Codex's model picker aligned with its configured provider."""
+import argparse
+import copy
+from dataclasses import dataclass, field
+import fnmatch
+import http.client
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-program=${0##*/}
-managed_marker='# managed by codex-model-picker-policy'
-work_tmp=
-atomic_tmp=
+try:
+    import tomllib
+except ImportError:
+    sys.exit('codex-model-picker-policy: Python 3.11 or newer is required')
 
-cleanup() {
-  if [ -n "$atomic_tmp" ] && [ -f "$atomic_tmp" ]; then
-    rm -f -- "$atomic_tmp"
-  fi
-  if [ -n "$work_tmp" ] && [ -d "$work_tmp" ]; then
-    rm -rf -- "$work_tmp"
-  fi
-}
-trap cleanup EXIT HUP INT TERM
+MARKER = '# managed by codex-model-picker-policy'
+PIN = re.compile(r'^\s*(?:model_catalog_json|"model_catalog_json"|\'model_catalog_json\')\s*=')
+MAX_RESPONSE = 32 * 1024 * 1024
+POLICY_METADATA = '_model_picker'
 
-die() {
-  printf '%s: %s\n' "$program" "$*" >&2
-  exit 1
-}
 
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
-}
+class PolicyError(Exception):
+    pass
 
-codex_home=${CODEX_HOME:-"$HOME/.codex"}
-config_file=$codex_home/config.toml
-catalog_file=$codex_home/model-catalog.json
 
-prepare_work_dir() {
-  [ -n "$work_tmp" ] && return
-  work_tmp=$(mktemp -d "${TMPDIR:-/tmp}/codex-model-picker-policy.XXXXXX") ||
-    die 'could not create a temporary directory'
-  chmod 700 "$work_tmp"
-}
+def read_config(path):
+    text = path.read_text() if path.exists() else ''
+    try:
+        return text, tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        raise PolicyError('invalid config.toml; fix its TOML before continuing') from None
 
-write_discovery_config() {
-  discovery_home=$1
-  [ -f "$config_file" ] || return 0
 
-  awk '
-    BEGIN { in_root = 1 }
-    in_root && /^[[:space:]]*\[/ { in_root = 0 }
-    in_root && /^[[:space:]]*model_catalog_json[[:space:]]*=/ { next }
-    { print }
-  ' "$config_file" >"$discovery_home/config.toml"
-  chmod 600 "$discovery_home/config.toml"
-}
+def merge_config(base, overlay):
+    result = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_config(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
 
-discover_live_catalog() {
-  output_file=$1
-  prepare_work_dir
-  discovery_home=$work_tmp/discovery-home
-  mkdir -p "$discovery_home"
-  chmod 700 "$discovery_home"
-  write_discovery_config "$discovery_home"
 
-  if [ -f "$codex_home/auth.json" ]; then
-    ln -s "$codex_home/auth.json" "$discovery_home/auth.json"
-  fi
+class CodexConfiguration:
+    """Resolve one selected connection; keep configuration precedence in one place."""
 
-  if ! (cd "$discovery_home" && CODEX_HOME="$discovery_home" codex debug models) >"$output_file"; then
-    die 'codex debug models failed while discovering the live catalog'
-  fi
-}
+    def __init__(self, home, args):
+        self.home = home
+        self.path = home / 'config.toml'
+        self.text, self.values = read_config(self.path)
+        self.catalog_overridden = False
+        self.profile = args.profile
+        if 'profile' in self.values or 'profiles' in self.values:
+            raise PolicyError('legacy inline profiles are unsupported; use <name>.config.toml and --profile NAME, as current Codex does')
+        if self.profile:
+            if not re.fullmatch(r'[A-Za-z0-9_-]+', self.profile):
+                raise PolicyError('--profile must contain only letters, numbers, underscores, or hyphens')
+            self.path = home / f'{self.profile}.config.toml'
+            if not self.path.is_file():
+                raise PolicyError('selected profile file does not exist in CODEX_HOME')
+            self.text, profile = read_config(self.path)
+            self.values = merge_config(self.values, profile)
+        for override in args.config:
+            key, separator, value = override.partition('=')
+            if not separator or not key.strip():
+                raise PolicyError('--config expects a dotted key=value assignment')
+            try:
+                parsed = tomllib.loads(override)
+            except tomllib.TOMLDecodeError:
+                try:
+                    parsed = tomllib.loads(f'{key} = {json.dumps(value.strip())}')
+                except tomllib.TOMLDecodeError:
+                    raise PolicyError('invalid --config key') from None
+            self.values = merge_config(self.values, parsed)
+            self.catalog_overridden |= 'model_catalog_json' in parsed
+        self.catalog_path = home / (f'model-catalog-{self.profile}.json' if self.profile else 'model-catalog.json')
 
-refresh_catalog() {
-  require_command codex
-  require_command jq
-  mkdir -p "$codex_home"
-  prepare_work_dir
-  raw_catalog=$work_tmp/live-catalog.json
-  transformed_catalog=$work_tmp/model-catalog.json
+    def connection(self, args):
+        if args.source == 'codex':
+            return None
+        provider_id = args.provider or self.values.get('model_provider', 'openai')
+        providers = self.values.get('model_providers', {})
+        if not isinstance(provider_id, str) or not isinstance(providers, dict):
+            raise PolicyError('invalid model provider configuration')
+        provider = copy.deepcopy(providers.get(provider_id, {}))
+        if not isinstance(provider, dict):
+            raise PolicyError('invalid model provider configuration')
+        if provider_id == 'openai':
+            # The built-in provider's URL override is a root setting in Codex.
+            provider = {'base_url': self.values.get('openai_base_url'), 'env_key': 'OPENAI_API_KEY'}
+        base = args.base_url or provider.get('base_url')
+        if not base:
+            if provider_id == 'openai' and args.source == 'auto':
+                return None
+            raise PolicyError('selected provider has no base_url; configure it in Codex or supply --base-url')
+        return Connection(provider_id, models_url(base, provider.get('query_params', {})), proxy_headers(provider, args), args.timeout)
 
-  discover_live_catalog "$raw_catalog"
-  jq -e 'type == "object" and (.models | type == "array") and all(.models[]; (.slug | type == "string"))' \
-    "$raw_catalog" >/dev/null || die 'codex returned an invalid model catalog'
+@dataclass
+class Connection:
+    provider: str
+    url: str = field(repr=False)
+    headers: dict = field(repr=False)
+    timeout: float = 30
 
-  jq '
-    .models |= map(
-      .visibility = (
-        if .slug == "codex-auto-review"
-        then "hide"
-        else "list"
-        end
-      )
+
+def edit_pin(text, replacement=None, managed_only=False):
+    """Preserve user formatting and verify that only the intended TOML key changed."""
+    before = tomllib.loads(text)
+    lines = []
+    root = True
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith('['):
+            root = False
+        if root and PIN.match(line) and (not managed_only or MARKER in line):
+            continue
+        lines.append(line)
+    result = ''.join(lines)
+    if replacement is not None:
+        result = f'model_catalog_json = {json.dumps(str(replacement))} {MARKER}\n' + result
+    try:
+        after = tomllib.loads(result)
+    except tomllib.TOMLDecodeError:
+        raise PolicyError('cannot safely edit this catalog setting; simplify its TOML syntax') from None
+    expected = copy.deepcopy(before)
+    if replacement is not None:
+        expected['model_catalog_json'] = str(replacement)
+    elif not managed_only or 'model_catalog_json' not in after:
+        expected.pop('model_catalog_json', None)
+    if after != expected:
+        raise PolicyError('cannot safely edit this catalog setting; simplify its TOML syntax')
+    return result
+
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f'.{path.name}.tmp.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def write_config(path, old, new):
+    if old == new:
+        return
+    if path.exists():
+        backup = path.with_name(f'{path.name}.bak.{time.time_ns()}.{os.getpid()}')
+        atomic_write(backup, old)
+    atomic_write(path, new)
+
+
+def visibility(model, exclusions=()):
+    slug = model['slug'].lower()
+    # Multimodal *input* is normal for coding models. Specialized outputs are not.
+    outputs = model.get('output_modalities') or []
+    non_chat = (
+        re.search(r'(?:^|[/_.-])(?:image|imagen|dall-e|flux|stable-diffusion|embeddings?|rerank(?:er)?|whisper|tts|moderation|realtime|audio|sora|video)(?:$|[/_.-])', slug)
+        or model.get('model_specialty') in ('image', 'image_generation', 'embedding', 'embeddings',
+                                          'audio', 'speech', 'transcription', 'moderation', 'rerank', 'video')
+        or model.get('task') in ('text-to-image', 'image-generation', 'text-to-speech',
+                                'automatic-speech-recognition', 'feature-extraction', 'text-to-video')
+        or (outputs and 'text' not in outputs)
     )
-  ' "$raw_catalog" >"$transformed_catalog"
+    hidden = non_chat or slug == 'codex-auto-review' or any(fnmatch.fnmatchcase(slug, pattern.lower()) for pattern in exclusions)
+    return 'hide' if hidden else 'list'
 
-  atomic_tmp=$(mktemp "$codex_home/.model-catalog.json.tmp.XXXXXX") ||
-    die 'could not create a temporary catalog beside the destination'
-  chmod 600 "$atomic_tmp"
-  cp "$transformed_catalog" "$atomic_tmp"
-  mv -f "$atomic_tmp" "$catalog_file"
-  atomic_tmp=
-}
 
-validate_and_report_catalog() {
-  file=$1
-  label=$2
-  [ -f "$file" ] || die "$label does not exist: $file"
+def valid_id(value):
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip() and not any(ord(c) < 32 or ord(c) == 127 for c in value)
 
-  if ! jq -e '
-    type == "object" and
-    (.models | type == "array") and
-    all(.models[];
-      (.slug | type == "string") and
-      (.visibility == (
-        if .slug == "codex-auto-review"
-        then "hide"
-        else "list"
-        end
-      ))
-    )
-  ' "$file" >/dev/null; then
-    die "$label violates the visibility policy"
-  fi
 
-  counts=$(jq -r '[
-    (.models | length),
-    ([.models[] | select(.visibility == "list")] | length),
-    ([.models[] | select(.visibility == "hide")] | length)
-  ] | map(tostring) | join(" ")' "$file")
-  set -- $counts
-  printf '%s: total=%s visible=%s hidden=%s\n' "$label" "$1" "$2" "$3"
-}
+def catalog_models(catalog, label):
+    models = catalog.get('models') if isinstance(catalog, dict) else None
+    if not isinstance(models, list) or not models:
+        raise PolicyError(f'{label}: expected a nonempty models array')
+    ids = []
+    for model in models:
+        if not isinstance(model, dict) or not valid_id(model.get('slug')):
+            raise PolicyError(f'{label}: invalid model slug')
+        ids.append(model['slug'])
+    if len(set(ids)) != len(ids):
+        raise PolicyError(f'{label}: duplicate model IDs')
+    return models
 
-verify_binary_catalog() {
-  binary=$1
-  label=$2
-  prepare_work_dir
-  binary_catalog=$work_tmp/verified-catalog.$$
-  if ! (cd "$codex_home" && CODEX_HOME="$codex_home" "$binary" debug models) >"$binary_catalog"; then
-    die "$label failed to render its model catalog"
-  fi
-  validate_and_report_catalog "$binary_catalog" "$label"
-}
 
-verify_macos_app_binaries() {
-  [ "$(uname -s)" = Darwin ] || return 0
-  prepare_work_dir
-  app_binaries=$work_tmp/macos-app-binaries
-  : >"$app_binaries"
+def apply_policy(catalog, exclusions=()):
+    for model in catalog_models(catalog, 'discovered catalog'):
+        model['visibility'] = visibility(model, exclusions)
+    metadata = catalog.setdefault(POLICY_METADATA, {})
+    metadata['exclude'] = list(exclusions)
+    return catalog
 
-  for applications_dir in /Applications "$HOME/Applications"; do
-    [ -d "$applications_dir" ] || continue
-    for app_bundle in "$applications_dir"/*Codex*.app "$applications_dir"/*ChatGPT*.app; do
-      [ -d "$app_bundle/Contents" ] || continue
-      find "$app_bundle/Contents" -type f -name codex -perm -111 -print 2>/dev/null >>"$app_binaries"
-    done
-  done
 
-  sort -u "$app_binaries" -o "$app_binaries"
-  while IFS= read -r app_binary; do
-    [ -n "$app_binary" ] || continue
-    verify_binary_catalog "$app_binary" "desktop app ($app_binary)"
-  done <"$app_binaries"
-}
+def picker_exclusions(catalog):
+    if not isinstance(catalog, dict):
+        raise PolicyError('invalid saved catalog')
+    metadata = catalog.get(POLICY_METADATA, {})
+    if not isinstance(metadata, dict):
+        raise PolicyError('invalid saved picker policy metadata')
+    exclusions = metadata.get('exclude', [])
+    if not isinstance(exclusions, list) or any(not isinstance(pattern, str) for pattern in exclusions):
+        raise PolicyError('invalid saved picker exclusions')
+    return exclusions
 
-check_policy() {
-  require_command codex
-  require_command jq
-  validate_and_report_catalog "$catalog_file" 'managed catalog'
-  verify_binary_catalog "$(command -v codex)" 'codex CLI'
-  verify_macos_app_binaries
-}
 
-remove_override() {
-  if [ ! -f "$config_file" ]; then
-    printf '%s\n' "No configuration file found; nothing to remove: $config_file"
-    return
-  fi
+def validate(catalog, label):
+    models = catalog_models(catalog, label)
+    exclusions = picker_exclusions(catalog)
+    if any(m.get('visibility') != visibility(m, exclusions) for m in models):
+        raise PolicyError(f'{label} violates the visibility policy')
+    visible = sum(m['visibility'] == 'list' for m in models)
+    print(f'{label}: total={len(models)} visible={visible} hidden={len(models) - visible}')
 
-  prepare_work_dir
-  new_config=$work_tmp/config.without-managed-override.toml
-  awk -v marker="$managed_marker" '
-    BEGIN { in_root = 1 }
-    in_root && /^[[:space:]]*\[/ { in_root = 0 }
-    in_root && /^[[:space:]]*model_catalog_json[[:space:]]*=/ && index($0, marker) { next }
-    { print }
-  ' "$config_file" >"$new_config"
 
-  if cmp -s "$config_file" "$new_config"; then
-    printf '%s\n' "No managed override found; configuration unchanged: $config_file"
-    return
-  fi
+def parse_json(data, label):
+    try:
+        return json.loads(data)
+    except (ValueError, UnicodeError):
+        raise PolicyError(f'{label}: invalid JSON response') from None
 
-  backup_file=$config_file.bak.$(date +%Y%m%d%H%M%S).$$
-  cp -p "$config_file" "$backup_file"
-  atomic_tmp=$(mktemp "$codex_home/.config.toml.tmp.XXXXXX") ||
-    die 'could not create a temporary config beside the destination'
-  chmod 600 "$atomic_tmp"
-  cp "$new_config" "$atomic_tmp"
-  mv -f "$atomic_tmp" "$config_file"
-  atomic_tmp=
-  printf '%s\n' "Removed managed override; retained catalog: $catalog_file"
-}
 
-install_override() {
-  refresh_catalog
-  mkdir -p "$codex_home"
+def run_codex(arguments, home, timeout):
+    binary = arguments[0]
+    if not shutil.which(binary):
+        raise PolicyError('codex is required; install a CLI with the debug models command')
+    try:
+        result = subprocess.run(arguments, cwd=home, env={**os.environ, 'CODEX_HOME': str(home)},
+                                capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise PolicyError('Codex discovery timed out; adjust --timeout') from None
+    if result.returncode:
+        # CLI errors can include configuration values or response bodies.
+        raise PolicyError('Codex discovery failed; check CLI support for debug models and provider configuration')
+    return result.stdout
 
-  path_literal=$(jq -Rn --arg value "$catalog_file" '$value')
-  managed_line="model_catalog_json = $path_literal $managed_marker"
-  prepare_work_dir
-  new_config=$work_tmp/config.toml
 
-  if [ -f "$config_file" ]; then
-    awk -v replacement="$managed_line" '
-      BEGIN { in_root = 1; installed = 0 }
-      in_root && /^[[:space:]]*\[/ {
-        if (!installed) {
-          print replacement
-          print ""
-          installed = 1
-        }
-        in_root = 0
-      }
-      in_root && /^[[:space:]]*model_catalog_json[[:space:]]*=/ {
-        if (!installed) {
-          print replacement
-          installed = 1
-        }
-        next
-      }
-      { print }
-      END {
-        if (!installed) {
-          if (NR > 0) print ""
-          print replacement
-        }
-      }
-    ' "$config_file" >"$new_config"
-  else
-    printf '%s\n' "$managed_line" >"$new_config"
-  fi
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
-  if [ -f "$config_file" ] && cmp -s "$config_file" "$new_config"; then
-    printf '%s\n' "Installed policy; configuration already current: $config_file"
-    return
-  fi
 
-  if [ -f "$config_file" ]; then
-    backup_file=$config_file.bak.$(date +%Y%m%d%H%M%S).$$
-    cp -p "$config_file" "$backup_file"
-  fi
+def get_json(url, headers, timeout, optional=False):
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        certificate = os.environ.get('CODEX_CA_CERTIFICATE') or os.environ.get('SSL_CERT_FILE')
+        context = ssl.create_default_context(cafile=certificate)
+        opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=context))
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read(MAX_RESPONSE + 1)
+    except urllib.error.HTTPError as error:
+        if optional and error.code in (400, 404, 405, 422, 501):
+            return None
+        hint = 'check the provider credentials' if error.code in (401, 403) else 'check the proxy URL and model endpoint'
+        raise PolicyError(f'proxy returned HTTP {error.code}; {hint}') from None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException):
+        raise PolicyError('proxy request failed; check connectivity, TLS, credentials, and --timeout') from None
+    if len(raw) > MAX_RESPONSE:
+        raise PolicyError('proxy model response exceeds 32 MiB')
+    return parse_json(raw, 'proxy')
 
-  atomic_tmp=$(mktemp "$codex_home/.config.toml.tmp.XXXXXX") ||
-    die 'could not create a temporary config beside the destination'
-  chmod 600 "$atomic_tmp"
-  cp "$new_config" "$atomic_tmp"
-  mv -f "$atomic_tmp" "$config_file"
-  atomic_tmp=
-  printf '%s\n' "Installed model-picker policy in $config_file"
-}
 
-usage() {
-  printf 'Usage: %s {install|refresh|check|remove}\n' "$program"
-}
+def proxy_headers(provider, args):
+    headers = {'Accept': 'application/json', 'User-Agent': 'codex-model-picker-policy'}
+    headers.update(provider.get('http_headers', {}))
+    for name, variable in provider.get('env_http_headers', {}).items():
+        value = os.environ.get(variable)
+        if value:
+            headers[name] = value
+    variable = args.api_key_env or provider.get('env_key')
+    token = os.environ.get(variable) if variable else provider.get('experimental_bearer_token')
+    if variable and not token:
+        raise PolicyError(f'API key environment variable is unset: {variable}')
+    if token:
+        headers = {k: v for k, v in headers.items() if k.lower() != 'authorization'}
+        headers['Authorization'] = f'Bearer {token}'
+    elif provider.get('auth') or provider.get('requires_openai_auth'):
+        raise PolicyError('this provider needs authentication; supply --api-key-env with a proxy API key')
+    if any(not isinstance(k, str) or not isinstance(v, str) or '\n' in v or '\r' in v for k, v in headers.items()):
+        raise PolicyError('invalid provider HTTP headers')
+    return headers
 
-case ${1-} in
-  install)
-    [ "$#" -eq 1 ] || die 'install takes no arguments'
-    install_override
-    ;;
-  refresh)
-    [ "$#" -eq 1 ] || die 'refresh takes no arguments'
-    refresh_catalog
-    printf '%s\n' "Refreshed model catalog: $catalog_file"
-    ;;
-  check)
-    [ "$#" -eq 1 ] || die 'check takes no arguments'
-    check_policy
-    ;;
-  remove)
-    [ "$#" -eq 1 ] || die 'remove takes no arguments'
-    remove_override
-    ;;
-  *)
-    usage >&2
-    exit 64
-    ;;
-esac
+
+def models_url(base, query=None):
+    try:
+        parsed = urllib.parse.urlsplit(base)
+        valid = parsed.scheme in ('http', 'https') and parsed.hostname and parsed.port != 0
+    except ValueError:
+        valid = False
+    if not valid or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise PolicyError('--base-url must be an HTTP(S) API base URL without credentials, query, or fragment')
+    path = parsed.path.rstrip('/')
+    if not path:
+        path = '/v1'
+    if not path.endswith('/models'):
+        path += '/models'
+    if query and (not isinstance(query, dict) or any(not isinstance(v, str) for v in query.values())):
+        raise PolicyError('provider query_params must map strings to strings')
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, urllib.parse.urlencode(query or {}), ''))
+
+
+def compare_ids(expected, actual, label):
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing or extra:
+        # JSON escaping makes server-provided IDs safe to display in terminals.
+        raise PolicyError(f'{label}: model lists differ; missing={json.dumps(missing)} extra={json.dumps(extra)}')
+
+
+def toml_text(values):
+    """Serialize an isolated discovery config, keeping secrets out of argv."""
+    def encode(value):
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            return '[' + ', '.join(encode(item) for item in value) + ']'
+        if isinstance(value, dict):
+            return '{' + ', '.join(f'{json.dumps(key)} = {encode(item)}' for key, item in value.items()) + '}'
+        if hasattr(value, 'isoformat'):
+            return value.isoformat()
+        raise PolicyError('unsupported configuration value')
+    return ''.join(f'{json.dumps(key)} = {encode(value)}\n' for key, value in values.items())
+
+
+def generic_model(slug, priority):
+    """A valid Codex entry without another model's prompts or capabilities."""
+    return {
+        'slug': slug, 'display_name': slug,
+        'description': 'Custom provider model; capabilities not advertised.',
+        'base_instructions': 'You are a coding assistant. Use the provided tools to help with coding tasks.',
+        'supported_reasoning_levels': [], 'shell_type': 'default',
+        'visibility': 'list', 'supported_in_api': True, 'priority': priority,
+        'support_verbosity': False, 'truncation_policy': {'mode': 'tokens', 'limit': 10000},
+        'experimental_supported_tools': [], 'input_modalities': ['text'],
+        'supports_reasoning_summary_parameter': False, 'default_reasoning_summary': 'none',
+        'apply_patch_tool_type': None, 'supports_search_tool': False,
+        'use_responses_lite': False, 'tool_mode': 'direct',
+    }
+
+
+def inventory_entries(payload):
+    entries = payload.get('data') if isinstance(payload, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise PolicyError('provider /models: expected a nonempty data array')
+    if payload.get('has_more') or payload.get('next') or payload.get('next_page'):
+        raise PolicyError('provider returned a paginated model inventory; use an endpoint that lists all models')
+    if any(not isinstance(model, dict) or not valid_id(model.get('id')) for model in entries):
+        raise PolicyError('provider /models: invalid model ID')
+    if len({model['id'] for model in entries}) != len(entries):
+        raise PolicyError('provider /models: duplicate model IDs')
+    return entries
+
+
+class EndpointCatalog:
+    """One inventory, enriched by optional rich metadata or exact bundled matches."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def discover(self):
+        connection = self.connection
+        listing = get_json(connection.url, connection.headers, connection.timeout)
+        if isinstance(listing, dict) and 'models' in listing:
+            for model in catalog_models(listing, 'provider catalog'):
+                model['supported_in_api'] = True
+            return {**listing, POLICY_METADATA: {'generic_models': []}}
+        entries = inventory_entries(listing)
+        with tempfile.TemporaryDirectory(prefix='codex-model-picker-policy.') as directory:
+            home = Path(directory)
+            version = run_codex(['codex', '--version'], home, connection.timeout).decode().strip().split()[-1]
+            parsed = urllib.parse.urlsplit(connection.url)
+            query = dict(urllib.parse.parse_qsl(parsed.query))
+            query['client_version'] = version
+            rich_url = urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+            rich = get_json(rich_url, connection.headers, connection.timeout, optional=True)
+            if rich is None:
+                rich = {}
+            elif isinstance(rich, dict) and 'data' in rich and 'models' not in rich:
+                inventory_entries(rich)  # Standard endpoints often ignore client_version.
+                rich = {}
+            else:
+                catalog_models(rich, 'provider rich catalog')
+            known = {model['slug']: model for model in rich.get('models', [])}
+            missing = {entry['id'] for entry in entries} - known.keys()
+            bundled = {}
+            if missing:
+                payload = parse_json(run_codex(['codex', 'debug', 'models', '--bundled'], home, connection.timeout), 'bundled catalog')
+                bundled = {model['slug']: model for model in catalog_models(payload, 'bundled catalog')}
+            models, generic = [], []
+            for priority, entry in enumerate(sorted(entries, key=lambda model: model['id'])):
+                slug = entry['id']
+                template = known.get(slug, bundled.get(slug))
+                if template is None:
+                    model = generic_model(slug, priority)
+                    generic.append(slug)
+                else:
+                    model = copy.deepcopy(template)
+                # Preserve richer metadata, filling gaps from the inventory. In particular,
+                # rich catalogs may omit output modalities needed to identify image aliases.
+                for key in ('display_name', 'description', 'context_window', 'input_modalities',
+                            'output_modalities', 'model_specialty', 'task', 'supported_reasoning_levels',
+                            'default_reasoning_level', 'supports_reasoning_summary_parameter'):
+                    if key in entry and (slug not in known or model.get(key) is None):
+                        model[key] = copy.deepcopy(entry[key])
+                model['supported_in_api'] = True
+                models.append(model)
+        return {**rich, 'models': models, POLICY_METADATA: {'generic_models': generic}}
+
+
+def discover(configuration, args):
+    connection = configuration.connection(args)
+    if connection:
+        catalog = EndpointCatalog(connection).discover()
+    else:
+        with tempfile.TemporaryDirectory(prefix='codex-model-picker-policy.') as directory:
+            home = Path(directory)
+            values = copy.deepcopy(configuration.values)
+            values.pop('model_catalog_json', None)
+            atomic_write(home / 'config.toml', toml_text(values))
+            if (configuration.home / 'auth.json').exists():
+                (home / 'auth.json').symlink_to(configuration.home / 'auth.json')
+            catalog = parse_json(run_codex(['codex', 'debug', 'models'], home, args.timeout), 'Codex')
+        catalog[POLICY_METADATA] = {'generic_models': []}
+    return apply_policy(catalog, args.exclude or [])
+
+
+def load_catalog(path):
+    if not path.exists():
+        raise PolicyError('no managed catalog; run generate or use list --live')
+    return parse_json(path.read_bytes(), 'managed catalog')
+
+
+def verify_generated_catalog(catalog, timeout, binary='codex'):
+    """Have the installed CLI parse the file before replacing a working catalog."""
+    with tempfile.TemporaryDirectory(prefix='codex-model-picker-policy.verify.') as directory:
+        home = Path(directory)
+        path = home / 'model-catalog.json'
+        atomic_write(path, json.dumps(catalog))
+        atomic_write(home / 'config.toml', edit_pin('', path))
+        rendered = parse_json(run_codex([binary, 'debug', 'models'], home, timeout), 'Codex validation')
+        models = catalog_models(rendered, 'Codex validation')
+        compare_ids({m['slug'] for m in catalog['models']}, {m['slug'] for m in models}, 'Codex validation')
+        expected_visibility = {model['slug']: model['visibility'] for model in catalog['models']}
+        if any(m.get('visibility') != expected_visibility[m['slug']] for m in models):
+            raise PolicyError('Codex did not load the generated visibility policy')
+
+
+def check(configuration, path, args):
+    catalog = load_catalog(path)
+    validate(catalog, 'managed catalog')
+    pin = configuration.values.get('model_catalog_json')
+    if not isinstance(pin, str) or (configuration.home / pin).resolve() != path:
+        raise PolicyError('selected Codex configuration does not point to the managed catalog; run install with the same --profile')
+    expected = {m['slug'] for m in catalog['models']}
+    binaries = [('codex', 'codex CLI')]
+    if sys.platform == 'darwin':
+        for root in (Path('/Applications'), Path.home() / 'Applications'):
+            for pattern in ('*Codex*.app', '*ChatGPT*.app'):
+                for app in root.glob(pattern):
+                    binaries.extend((str(p), f'desktop app ({p})') for p in (app / 'Contents').rglob('codex') if p.is_file() and os.access(p, os.X_OK))
+    for binary, label in binaries:
+        verify_generated_catalog(catalog, args.timeout, binary)
+        print(f'{label}: catalog accepted; model IDs and visibility match')
+    if args.live:
+        if args.exclude is None:
+            args.exclude = picker_exclusions(catalog)
+        live = discover(configuration, args)
+        compare_ids({m['slug'] for m in live['models']}, expected, 'managed catalog versus live provider; run generate or refresh')
+        live_visibility = {m['slug']: m['visibility'] for m in live['models']}
+        if any(m['visibility'] != live_visibility[m['slug']] for m in catalog['models']):
+            raise PolicyError('live picker visibility changed; run generate or refresh')
+        print('Live provider: model IDs and visibility match')
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    commands = result.add_subparsers(dest='command', required=True)
+    for name, help_text in [('generate', 'fetch proxy models and write a catalog file'),
+                            ('install', 'generate a catalog and configure Codex'), ('refresh', 'alias for generate'),
+                            ('list', 'show saved models (or --live)'), ('check', 'verify policy and Codex catalog'), ('remove', 'remove only the managed config entry')]:
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument('-p', '--profile', help='Codex profile file: $CODEX_HOME/NAME.config.toml')
+        command.add_argument('-c', '--config', action='append', default=[], help='Codex key=value override; repeat the overrides used to launch Codex')
+        if name == 'remove':
+            continue
+        command.add_argument('--source', choices=['auto', 'proxy', 'codex'], default='auto', help='auto uses the configured provider base_url, otherwise Codex')
+        exclusions = command.add_mutually_exclusive_group()
+        exclusions.add_argument('--exclude', action='append', help='replace saved exclusions with these case-insensitive globs; repeat as needed')
+        exclusions.add_argument('--clear-exclusions', action='store_true', help='clear saved personal exclusions; retain general suitability filtering')
+        command.add_argument('--provider', help='provider ID in config.toml (defaults to the active provider)')
+        command.add_argument('--base-url', help='override the proxy API base URL, e.g. http://localhost:8317/v1')
+        command.add_argument('--api-key-env', help='environment variable containing the proxy API key')
+        command.add_argument('--timeout', type=float, default=30, help='per-request timeout in seconds (default: 30)')
+        if name in ('generate', 'install', 'refresh'):
+            command.add_argument('--dry-run', action='store_true', help='discover and summarize changes without writing files')
+        if name in ('generate', 'refresh'):
+            command.add_argument('--output', type=Path, help='destination (default: $CODEX_HOME/model-catalog.json)')
+        if name in ('list', 'check'):
+            command.add_argument('--live', action='store_true', help='query the live provider')
+        if name == 'list':
+            command.add_argument('--json', action='store_true', help='print the complete catalog as JSON')
+    return result
+
+
+def main():
+    arguments = sys.argv[1:]
+    if not arguments or arguments[0] not in ('generate', 'refresh', 'install', 'list', 'check', 'remove', '-h', '--help'):
+        arguments.insert(0, 'generate')
+    args = parser().parse_args(arguments)
+    if hasattr(args, 'timeout') and (not math.isfinite(args.timeout) or args.timeout <= 0):
+        raise PolicyError('--timeout must be a positive finite number')
+    if getattr(args, 'source', None) == 'codex' and any((args.provider, args.base_url, args.api_key_env)):
+        raise PolicyError('--source codex cannot be combined with proxy overrides')
+    home = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).expanduser().resolve()
+    configuration = CodexConfiguration(home, args)
+    config_path, catalog_path = configuration.path, configuration.catalog_path
+    text, config = configuration.text, configuration.values
+    if getattr(args, 'output', None):
+        catalog_path = args.output.expanduser().resolve()
+    if catalog_path in (config_path.resolve(), (home / 'config.toml').resolve(), (home / 'auth.json').resolve()) or catalog_path in home.glob('*.config.toml'):
+        raise PolicyError('--output cannot overwrite Codex configuration or credentials')
+    if hasattr(args, 'exclude') and args.exclude is None:
+        args.exclude = [] if args.clear_exclusions or not catalog_path.exists() else picker_exclusions(load_catalog(catalog_path))
+    if args.command == 'install' and configuration.catalog_overridden:
+        override = config.get('model_catalog_json')
+        if not isinstance(override, str) or (home / override).resolve() != catalog_path:
+            raise PolicyError('model_catalog_json launch override conflicts with the installation; remove that --config override')
+    if args.command == 'remove':
+        write_config(config_path, text, edit_pin(text, managed_only=True))
+        print(f'Removed managed override (if present); retained catalog: {catalog_path}')
+    elif args.command == 'check':
+        check(configuration, catalog_path, args)
+    elif args.command == 'list':
+        catalog = discover(configuration, args) if args.live else load_catalog(catalog_path)
+        models = catalog_models(catalog, 'model catalog')
+        if args.json:
+            print(json.dumps(catalog, indent=2))
+        else:
+            for model in models:
+                print(f'{model.get("visibility", "unknown"):4}  {model["slug"]}')
+    else:
+        new_config = edit_pin(text, catalog_path) if args.command == 'install' else text
+        catalog = discover(configuration, args)
+        verify_generated_catalog(catalog, args.timeout)
+        validate(catalog, 'discovered catalog')
+        generic = catalog.get(POLICY_METADATA, {}).get('generic_models', [])
+        if generic:
+            print(f'{len(generic)} models use generic defaults; context and reasoning limits remain unknown unless advertised.')
+        if args.dry_run:
+            if catalog_path.exists():
+                old = {m['slug'] for m in catalog_models(load_catalog(catalog_path), 'managed catalog')}
+            else:
+                old = set()
+            new = {m['slug'] for m in catalog['models']}
+            print(f'Added: {json.dumps(sorted(new - old))}\nRemoved: {json.dumps(sorted(old - new))}')
+            print('Dry run: no files changed')
+            return
+        if args.command == 'install' and read_config(config_path)[0] != text:
+            raise PolicyError('configuration changed during discovery; rerun install')
+        atomic_write(catalog_path, json.dumps(catalog, indent=2) + '\n')
+        if args.command == 'install':
+            write_config(config_path, text, new_config)
+        print(f'{args.command.capitalize()} complete: {catalog_path}')
+        if args.command == 'install' or config.get('model_catalog_json') == str(catalog_path):
+            print('Restart Codex to reload the model picker.')
+        else:
+            print('Use install to configure Codex, or set model_catalog_json to this file.')
+
+
+if __name__ == '__main__':
+    os.umask(0o077)
+    for termination_signal in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(termination_signal, lambda signum, frame: sys.exit(128 + signum))
+    try:
+        main()
+    except PolicyError as error:
+        sys.exit(f'codex-model-picker-policy: {error}')
+    except (OSError, ValueError, TypeError, KeyError, IndexError) as error:
+        # Never dump exceptions that might contain configuration or credentials.
+        sys.exit(f'codex-model-picker-policy: operation failed ({type(error).__name__}); check configuration and file permissions')
+    except KeyboardInterrupt:
+        sys.exit(130)

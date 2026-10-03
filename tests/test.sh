@@ -67,7 +67,7 @@ test_refresh_bypasses_pin_and_keeps_internal_models_hidden() {
       {"slug":"deepseek/deepseek-v4-pro","visibility":"list"},
       {"slug":"Unsloth/GLM-4.7-Flash-GUFF","visibility":"list"},
       {"slug":"codex-auto-review","visibility":"hide"},
-      {"slug":"gpt-image-1","visibility":"list"}
+      {"slug":"gpt-image-1","visibility":"hide"}
     ]
   ' "$test_home/model-catalog.json" >/dev/null ||
     fail 'refresh did not apply the visibility policy'
@@ -87,11 +87,11 @@ test_check_reports_counts_and_rejects_policy_drift() {
     CODEX_HOME="$test_home" \
     CODEX_POLICY_TEST_ROOT="$project_root" \
     "$project_root/codex-model-picker-policy" check)
-  printf '%s\n' "$check_output" | grep -F 'total=5 visible=4 hidden=1' >/dev/null ||
+  printf '%s\n' "$check_output" | grep -F 'total=5 visible=3 hidden=2' >/dev/null ||
     fail 'check did not report expected totals'
 
   cp "$test_home/model-catalog.json" "$test_home/catalog.before"
-  for slug in gpt-5.6-sol deepseek/deepseek-v4-pro Unsloth/GLM-4.7-Flash-GUFF codex-auto-review; do
+  for slug in gpt-5.6-sol deepseek/deepseek-v4-pro Unsloth/GLM-4.7-Flash-GUFF codex-auto-review gpt-image-1; do
     jq --arg slug "$slug" '
       (.models[] | select(.slug == $slug)).visibility |=
         if . == "hide" then "list" else "hide" end
@@ -145,3 +145,4 @@ test_check_reports_counts_and_rejects_policy_drift
 printf '%s\n' 'PASS: check reports counts and rejects policy drift'
 test_remove_deletes_only_managed_override
 printf '%s\n' 'PASS: remove deletes only the managed override'
+python3 "$project_root/tests/test_proxy.py"
