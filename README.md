@@ -47,10 +47,40 @@ your proxy. `generate` and `refresh` are explicit names for the default command.
 ```
 
 `--dry-run` discovers and validates without changing files. `list` shows IDs and
-visibility. `remove` removes only the marked managed setting and retains the file.
+visibility. `remove` removes the marked managed setting, backs up and clears
+Codex's `models_cache.json`, and retains the generated catalog file. Restart Codex
+after removal. Unmanaged catalog settings and settings inherited from the user
+configuration are retained and reported. The selected provider can advertise the
+same models again, so removing the policy does not restore the bundled model list.
 `check` verifies the configuration pointer and that Codex accepts the catalog;
 `check --live` also detects changed IDs and picker visibility at the endpoint.
 On macOS, checks include Codex executables in installed Codex/ChatGPT app bundles.
+
+## Restore factory models
+
+To reset the picker to the models shipped with your installed Codex CLI:
+
+```sh
+./codex-model-picker-policy reset --dry-run
+./codex-model-picker-policy reset
+./codex-model-picker-policy check --live
+```
+
+`reset` restores bundled model IDs, metadata, and visibility without contacting
+your provider, clears personal exclusions and the model cache, and backs up
+changed configuration and catalog files. It preserves your provider, credentials,
+and selected model. Restart Codex to load the reset picker.
+
+The bundled catalog is installed as `model_catalog_json` so a proxy's model
+inventory cannot replace it on restart. `check --live` compares a factory catalog
+with the installed CLI's bundle instead of the proxy. Rerun `reset` after a Codex
+upgrade to pick up its new bundled models. Use `install` to return to your proxy's
+inventory, or `remove` to return to ordinary Codex discovery. A launch-time
+`-c model_catalog_json=...` override must be removed if it selects another catalog.
+
+`reset --profile NAME` changes only that profile's catalog and configuration.
+The model cache is shared across profiles; clearing it causes other profiles to
+reload their inventory too. Backups use the original filename with `.bak.*`.
 
 ## Follow the same Codex configuration
 

@@ -167,6 +167,14 @@ def write_config(path, old, new):
     atomic_write(path, new)
 
 
+def clear_model_cache(home):
+    """Retire the shared model cache without losing the previous inventory."""
+    cache = home / 'models_cache.json'
+    if cache.exists() or cache.is_symlink():
+        backup = cache.with_name(f'{cache.name}.bak.{time.time_ns()}.{os.getpid()}')
+        cache.replace(backup)
+
+
 def visibility(model, exclusions=()):
     slug = model['slug'].lower()
     # Multimodal *input* is normal for coding models. Specialized outputs are not.
@@ -224,7 +232,8 @@ def picker_exclusions(catalog):
 def validate(catalog, label):
     models = catalog_models(catalog, label)
     exclusions = picker_exclusions(catalog)
-    if any(m.get('visibility') != visibility(m, exclusions) for m in models):
+    bundled = catalog.get(POLICY_METADATA, {}).get('source') == 'bundled'
+    if not bundled and any(m.get('visibility') != visibility(m, exclusions) for m in models):
         raise PolicyError(f'{label} violates the visibility policy')
     visible = sum(m['visibility'] == 'list' for m in models)
     print(f'{label}: total={len(models)} visible={visible} hidden={len(models) - visible}')
@@ -451,6 +460,15 @@ def load_catalog(path):
     return parse_json(path.read_bytes(), 'managed catalog')
 
 
+def bundled_catalog(timeout):
+    """Load factory models without user configuration, cache, or provider refresh."""
+    with tempfile.TemporaryDirectory(prefix='codex-model-picker-policy.factory.') as directory:
+        catalog = parse_json(run_codex(['codex', 'debug', 'models', '--bundled'], Path(directory), timeout), 'bundled catalog')
+    catalog_models(catalog, 'bundled catalog')
+    catalog[POLICY_METADATA] = {'source': 'bundled', 'exclude': []}
+    return catalog
+
+
 def verify_generated_catalog(catalog, timeout, binary='codex'):
     """Have the installed CLI parse the file before replacing a working catalog."""
     with tempfile.TemporaryDirectory(prefix='codex-model-picker-policy.verify.') as directory:
@@ -483,14 +501,20 @@ def check(configuration, path, args):
         verify_generated_catalog(catalog, args.timeout, binary)
         print(f'{label}: catalog accepted; model IDs and visibility match')
     if args.live:
-        if args.exclude is None:
-            args.exclude = picker_exclusions(catalog)
-        live = discover(configuration, args)
-        compare_ids({m['slug'] for m in live['models']}, expected, 'managed catalog versus live provider; run generate or refresh')
+        bundled = catalog.get(POLICY_METADATA, {}).get('source') == 'bundled'
+        if bundled:
+            live = bundled_catalog(args.timeout)
+            label = 'managed catalog versus installed Codex bundle; run reset'
+        else:
+            if args.exclude is None:
+                args.exclude = picker_exclusions(catalog)
+            live = discover(configuration, args)
+            label = 'managed catalog versus live provider; run generate or refresh'
+        compare_ids({m['slug'] for m in live['models']}, expected, label)
         live_visibility = {m['slug']: m['visibility'] for m in live['models']}
         if any(m['visibility'] != live_visibility[m['slug']] for m in catalog['models']):
-            raise PolicyError('live picker visibility changed; run generate or refresh')
-        print('Live provider: model IDs and visibility match')
+            raise PolicyError(f'picker visibility changed; run {"reset" if bundled else "generate or refresh"}')
+        print(f'{"Installed Codex bundle" if bundled else "Live provider"}: model IDs and visibility match')
 
 
 def parser():
@@ -498,11 +522,17 @@ def parser():
     commands = result.add_subparsers(dest='command', required=True)
     for name, help_text in [('generate', 'fetch proxy models and write a catalog file'),
                             ('install', 'generate a catalog and configure Codex'), ('refresh', 'alias for generate'),
-                            ('list', 'show saved models (or --live)'), ('check', 'verify policy and Codex catalog'), ('remove', 'remove only the managed config entry')]:
+                            ('reset', 'restore the bundled Codex model list; keep the provider'),
+                            ('list', 'show saved models (or --live)'), ('check', 'verify policy and Codex catalog'),
+                            ('remove', 'remove the managed config entry and clear the model cache')]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument('-p', '--profile', help='Codex profile file: $CODEX_HOME/NAME.config.toml')
         command.add_argument('-c', '--config', action='append', default=[], help='Codex key=value override; repeat the overrides used to launch Codex')
         if name == 'remove':
+            continue
+        if name == 'reset':
+            command.add_argument('--timeout', type=float, default=30, help='Codex validation timeout in seconds (default: 30)')
+            command.add_argument('--dry-run', action='store_true', help='preview factory models without writing files')
             continue
         command.add_argument('--source', choices=['auto', 'proxy', 'codex'], default='auto', help='auto uses the configured provider base_url, otherwise Codex')
         exclusions = command.add_mutually_exclusive_group()
@@ -525,7 +555,7 @@ def parser():
 
 def main():
     arguments = sys.argv[1:]
-    if not arguments or arguments[0] not in ('generate', 'refresh', 'install', 'list', 'check', 'remove', '-h', '--help'):
+    if not arguments or arguments[0] not in ('generate', 'refresh', 'install', 'reset', 'list', 'check', 'remove', '-h', '--help'):
         arguments.insert(0, 'generate')
     args = parser().parse_args(arguments)
     if hasattr(args, 'timeout') and (not math.isfinite(args.timeout) or args.timeout <= 0):
@@ -542,13 +572,22 @@ def main():
         raise PolicyError('--output cannot overwrite Codex configuration or credentials')
     if hasattr(args, 'exclude') and args.exclude is None:
         args.exclude = [] if args.clear_exclusions or not catalog_path.exists() else picker_exclusions(load_catalog(catalog_path))
-    if args.command == 'install' and configuration.catalog_overridden:
+    if args.command in ('install', 'reset', 'remove') and configuration.catalog_overridden:
         override = config.get('model_catalog_json')
-        if not isinstance(override, str) or (home / override).resolve() != catalog_path:
+        if args.command == 'remove' or not isinstance(override, str) or (home / override).resolve() != catalog_path:
             raise PolicyError('model_catalog_json launch override conflicts with the installation; remove that --config override')
     if args.command == 'remove':
-        write_config(config_path, text, edit_pin(text, managed_only=True))
-        print(f'Removed managed override (if present); retained catalog: {catalog_path}')
+        new_config = edit_pin(text, managed_only=True)
+        write_config(config_path, text, new_config)
+        clear_model_cache(home)
+        print(f'Removed managed override (if present); cleared model cache; retained catalog: {catalog_path}')
+        remaining = tomllib.loads(new_config).get('model_catalog_json')
+        if args.profile and remaining is None:
+            remaining = read_config(home / 'config.toml')[1].get('model_catalog_json')
+        if remaining is not None:
+            print('An unmanaged or inherited model_catalog_json setting still selects a custom catalog.')
+        print('Restart Codex to reload the model picker. The selected provider can advertise its models again.')
+        print('Use reset to restore the bundled Codex model list while keeping your provider.')
     elif args.command == 'check':
         check(configuration, catalog_path, args)
     elif args.command == 'list':
@@ -560,8 +599,9 @@ def main():
             for model in models:
                 print(f'{model.get("visibility", "unknown"):4}  {model["slug"]}')
     else:
-        new_config = edit_pin(text, catalog_path) if args.command == 'install' else text
-        catalog = discover(configuration, args)
+        factory = args.command == 'reset'
+        new_config = edit_pin(text, catalog_path) if args.command in ('install', 'reset') else text
+        catalog = bundled_catalog(args.timeout) if factory else discover(configuration, args)
         verify_generated_catalog(catalog, args.timeout)
         validate(catalog, 'discovered catalog')
         generic = catalog.get(POLICY_METADATA, {}).get('generic_models', [])
@@ -576,13 +616,20 @@ def main():
             print(f'Added: {json.dumps(sorted(new - old))}\nRemoved: {json.dumps(sorted(old - new))}')
             print('Dry run: no files changed')
             return
-        if args.command == 'install' and read_config(config_path)[0] != text:
-            raise PolicyError('configuration changed during discovery; rerun install')
-        atomic_write(catalog_path, json.dumps(catalog, indent=2) + '\n')
-        if args.command == 'install':
+        if args.command in ('install', 'reset') and read_config(config_path)[0] != text:
+            raise PolicyError(f'configuration changed during discovery; rerun {args.command}')
+        rendered = json.dumps(catalog, indent=2) + '\n'
+        if factory:
+            write_config(catalog_path, catalog_path.read_text() if catalog_path.exists() else '', rendered)
+        else:
+            atomic_write(catalog_path, rendered)
+        if args.command in ('install', 'reset'):
             write_config(config_path, text, new_config)
+        if factory:
+            clear_model_cache(home)
+            print('Restored bundled model IDs, metadata, and visibility; cleared exclusions and model cache.')
         print(f'{args.command.capitalize()} complete: {catalog_path}')
-        if args.command == 'install' or config.get('model_catalog_json') == str(catalog_path):
+        if args.command in ('install', 'reset') or config.get('model_catalog_json') == str(catalog_path):
             print('Restart Codex to reload the model picker.')
         else:
             print('Use install to configure Codex, or set model_catalog_json to this file.')

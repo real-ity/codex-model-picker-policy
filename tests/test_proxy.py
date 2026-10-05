@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import tomllib
 import unittest
 import urllib.parse
 
@@ -120,6 +121,80 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), before)
         self.assertFalse(self.catalog.exists())
         self.assertEqual(list(self.home.iterdir()), [self.config])
+
+    def test_remove_clears_codex_model_cache_without_a_pin(self):
+        cache = self.home / 'models_cache.json'
+        old_cache = json.dumps({'models': [{'slug': 'old-proxy-model'}]})
+        cache.write_text(old_cache)
+        before = self.config.read_bytes()
+        result = self.invoke('remove')
+        self.assertFalse(cache.exists(), 'remove left the old model inventory in Codex cache')
+        backups = list(self.home.glob('models_cache.json.bak.*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), old_cache)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.server.state['requests'], [])
+        self.assertIn('Restart Codex', result.stdout)
+        self.invoke('remove')
+        self.assertEqual(list(self.home.glob('models_cache.json.bak.*')), backups)
+
+    def test_reset_restores_bundled_models_and_preserves_provider(self):
+        self.config.write_text('model_reasoning_effort = "low"\n' + self.config.read_text())
+        before = tomllib.loads(self.config.read_text())
+        auth = self.home / 'auth.json'
+        auth.write_text('{"auth_mode": "chatgpt", "tokens": {"fixture": "unchanged"}}')
+        auth_before = auth.read_bytes()
+        self.invoke('install', '--exclude', '*glm*')
+        cache = self.home / 'models_cache.json'
+        cache.write_text('{"models": [{"slug": "old-proxy-model"}]}')
+        self.server.state['requests'].clear()
+        self.env.pop('CODEX_POLICY_REQUIRE_UNPINNED', None)
+        result = self.invoke('reset')
+        after = tomllib.loads(self.config.read_text())
+        after.pop('model_catalog_json')
+        self.assertEqual(after, before)
+        self.assertEqual(auth.read_bytes(), auth_before)
+        bundled = json.loads((ROOT / 'tests/fixtures/live-catalog.json').read_text())
+        saved = json.loads(self.catalog.read_text())
+        self.assertEqual(saved['models'], bundled['models'])
+        self.assertNotIn('coding-alias', {m['slug'] for m in saved['models']})
+        self.assertEqual(saved['_model_picker']['source'], 'bundled')
+        self.assertEqual(saved['_model_picker']['exclude'], [])
+        self.assertFalse(cache.exists())
+        self.assertEqual(self.server.state['requests'], [])
+        self.assertIn('Restart Codex', result.stdout)
+        self.invoke('check', '--live')
+        self.assertEqual(self.server.state['requests'], [])
+
+    def test_reset_dry_run_and_cli_rejection_do_not_change_files(self):
+        before = self.config.read_bytes()
+        self.catalog.write_text('{"models": [{"slug": "old-proxy-model"}]}')
+        cache = self.home / 'models_cache.json'
+        cache.write_text('old cache')
+        old_catalog = self.catalog.read_bytes()
+        self.invoke('reset', '--dry-run')
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.catalog.read_bytes(), old_catalog)
+        self.assertEqual(cache.read_text(), 'old cache')
+        self.assertFalse(list(self.home.glob('*.bak.*')))
+        self.env['CODEX_POLICY_REJECT_CATALOG'] = '1'
+        self.invoke('reset', ok=False)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.catalog.read_bytes(), old_catalog)
+        self.assertEqual(cache.read_text(), 'old cache')
+        self.assertFalse(list(self.home.glob('*.bak.*')))
+
+    def test_reset_profile_updates_only_selected_profile(self):
+        profile = self.home / 'work.config.toml'
+        profile.write_text('model = "coding-alias"\nmodel_catalog_json = "/old/catalog.json"\n')
+        before = self.config.read_bytes()
+        self.invoke('reset', '--profile', 'work')
+        self.assertEqual(self.config.read_bytes(), before)
+        path = self.home / 'model-catalog-work.json'
+        self.assertEqual(tomllib.loads(profile.read_text())['model_catalog_json'], str(path))
+        self.assertTrue(path.exists())
+        self.invoke('check', '--profile', 'work', '--live')
+        self.assertEqual(self.server.state['requests'], [])
 
     def test_live_list_json_has_no_progress_noise_or_writes(self):
         result = self.invoke('list', '--live', '--json')

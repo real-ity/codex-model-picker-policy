@@ -46,6 +46,10 @@ class RealCodexTests(unittest.TestCase):
                 env = {**os.environ, 'CODEX_HOME': directory}
                 for key in ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_CA_CERTIFICATE', 'SSL_CERT_FILE'):
                     env.pop(key, None)
+                result = subprocess.run(['codex', 'debug', 'models', '--bundled'], cwd=directory, env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, 'real Codex failed to load its bundled catalog')
+                bundled = json.loads(result.stdout)['models']
                 result = subprocess.run([str(SCRIPT), 'install'], cwd=directory, env=env,
                                         capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -62,6 +66,20 @@ class RealCodexTests(unittest.TestCase):
                 self.assertEqual(models['extra-vision-model']['visibility'], 'list')
                 self.assertEqual(models['gpt-image-example']['visibility'], 'hide')
                 self.assertEqual(models['codex-auto-review']['visibility'], 'hide')
+                cache = home / 'models_cache.json'
+                cache.write_text(json.dumps({'models': list(models.values())}))
+                result = subprocess.run([str(SCRIPT), 'reset'], cwd=directory, env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(cache.exists())
+                self.assertEqual(json.loads((home / 'model-catalog.json').read_text())['models'], bundled)
+                result = subprocess.run(['codex', 'debug', 'models'], cwd=directory, env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, 'real Codex failed to load the factory catalog')
+                self.assertEqual(json.loads(result.stdout)['models'], bundled)
+                result = subprocess.run([str(SCRIPT), 'check', '--live'], cwd=directory, env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
         finally:
             server.shutdown()
             server.server_close()
