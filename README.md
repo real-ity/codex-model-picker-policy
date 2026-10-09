@@ -26,8 +26,11 @@ To generate the file and configure Codex to use it in one step:
 
 `install` adds the root `model_catalog_json` setting to the selected configuration
 file, preserves unrelated settings, and backs up changed configuration. Repeating
-it does not create another backup if the setting is unchanged. Restart Codex to
-reload the picker.
+it does not create another backup if the setting is unchanged. Current Codex TUIs
+read the picker from a shared app-server daemon whose model list is cached in
+memory, so `install` restarts a running daemon for you; if none is running, restart
+Codex to reload the picker. Pass `--no-daemon-restart` to leave the daemon alone
+and receive the restart reminder instead.
 
 To manage that setting yourself, use the generated file's absolute path:
 
@@ -48,8 +51,9 @@ your proxy. `generate` and `refresh` are explicit names for the default command.
 
 `--dry-run` discovers and validates without changing files. `list` shows IDs and
 visibility. `remove` removes the marked managed setting, backs up and clears
-Codex's `models_cache.json`, and retains the generated catalog file. Restart Codex
-after removal. Unmanaged catalog settings and settings inherited from the user
+Codex's `models_cache.json`, and retains the generated catalog file. A running
+app-server daemon is restarted after removal. Unmanaged catalog settings and
+settings inherited from the user
 configuration are retained and reported. The selected provider can advertise the
 same models again, so removing the policy does not restore the bundled model list.
 `check` verifies the configuration pointer and that Codex accepts the catalog;
@@ -69,7 +73,8 @@ To reset the picker to the models shipped with your installed Codex CLI:
 `reset` restores bundled model IDs, metadata, and visibility without contacting
 your provider, clears personal exclusions and the model cache, and backs up
 changed configuration and catalog files. It preserves your provider, credentials,
-and selected model. Restart Codex to load the reset picker.
+and selected model. A running app-server daemon is restarted to load the reset
+picker.
 
 The bundled catalog is installed as `model_catalog_json` so a proxy's model
 inventory cannot replace it on restart. `check --live` compares a factory catalog
