@@ -23,5 +23,25 @@ if [ "${1-}" = "--version" ]; then
   exit 0
 fi
 
+if [ "${1-}" = "app-server" ] && [ "${2-}" = "daemon" ] && [ "${3-}" = "version" ]; then
+  case "${CODEX_POLICY_DAEMON_STATUS-}" in
+    running) printf '%s\n' '{"status":"running","cliVersion":"test","appServerVersion":"test"}'; exit 0 ;;
+    stopped) printf '%s\n' '{"status":"stopped","cliVersion":"test","appServerVersion":"test"}'; exit 0 ;;
+    *) printf '%s\n' 'Error: failed to connect to the app-server control socket' >&2; exit 1 ;;
+  esac
+fi
+
+if [ "${1-}" = "app-server" ] && [ "${2-}" = "daemon" ] && [ "${3-}" = "restart" ]; then
+  if [ "${CODEX_POLICY_DAEMON_RESTART_FAILS-}" = 1 ]; then
+    printf '%s\n' 'Error: failed to restart the app-server daemon' >&2
+    exit 1
+  fi
+  if [ -n "${CODEX_POLICY_DAEMON_LOG-}" ]; then
+    printf '%s\n' 'restart' >>"$CODEX_POLICY_DAEMON_LOG"
+  fi
+  printf '%s\n' '{"status":"restarted","cliVersion":"test","appServerVersion":"test"}'
+  exit 0
+fi
+
 printf '%s\n' "unexpected fake codex arguments: $*" >&2
 exit 64

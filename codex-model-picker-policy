@@ -175,6 +175,35 @@ def clear_model_cache(home):
         cache.replace(backup)
 
 
+def daemon_restart(home, timeout):
+    """Restart the shared app-server daemon, whose model list lives in memory."""
+    try:
+        status = parse_json(run_codex(['codex', 'app-server', 'daemon', 'version'], home, timeout), 'app-server daemon')
+    except (PolicyError, OSError):
+        return 'stopped'
+    if not isinstance(status, dict) or status.get('status') != 'running':
+        return 'stopped'
+    try:
+        restarted = parse_json(run_codex(['codex', 'app-server', 'daemon', 'restart'], home, timeout), 'app-server daemon')
+    except (PolicyError, OSError):
+        return 'failed'
+    return 'restarted' if isinstance(restarted, dict) and restarted.get('status') == 'restarted' else 'failed'
+
+
+def reload_picker(home, timeout, skip=False):
+    """Reload the process that renders the picker; its model list outlives Codex restarts."""
+    if skip:
+        print('Restart Codex to reload the model picker.')
+        return
+    outcome = daemon_restart(home, timeout)
+    if outcome == 'restarted':
+        print('Restarted the local app-server daemon; the model picker is up to date.')
+    elif outcome == 'stopped':
+        print('Restart Codex to reload the model picker.')
+    else:
+        print('Could not restart the local app-server daemon; run `codex app-server daemon restart` to reload the model picker.', file=sys.stderr)
+
+
 def visibility(model, exclusions=()):
     slug = model['slug'].lower()
     # Multimodal *input* is normal for coding models. Specialized outputs are not.
@@ -528,6 +557,8 @@ def parser():
         command = commands.add_parser(name, help=help_text)
         command.add_argument('-p', '--profile', help='Codex profile file: $CODEX_HOME/NAME.config.toml')
         command.add_argument('-c', '--config', action='append', default=[], help='Codex key=value override; repeat the overrides used to launch Codex')
+        if name not in ('list', 'check'):
+            command.add_argument('--no-daemon-restart', action='store_true', help='do not restart a running app-server daemon after changing the catalog')
         if name == 'remove':
             continue
         if name == 'reset':
@@ -586,7 +617,8 @@ def main():
             remaining = read_config(home / 'config.toml')[1].get('model_catalog_json')
         if remaining is not None:
             print('An unmanaged or inherited model_catalog_json setting still selects a custom catalog.')
-        print('Restart Codex to reload the model picker. The selected provider can advertise its models again.')
+        reload_picker(home, getattr(args, 'timeout', 30), args.no_daemon_restart)
+        print('The selected provider can advertise its models again.')
         print('Use reset to restore the bundled Codex model list while keeping your provider.')
     elif args.command == 'check':
         check(configuration, catalog_path, args)
@@ -625,12 +657,12 @@ def main():
             atomic_write(catalog_path, rendered)
         if args.command in ('install', 'reset'):
             write_config(config_path, text, new_config)
-        if factory:
             clear_model_cache(home)
+        if factory:
             print('Restored bundled model IDs, metadata, and visibility; cleared exclusions and model cache.')
         print(f'{args.command.capitalize()} complete: {catalog_path}')
         if args.command in ('install', 'reset') or config.get('model_catalog_json') == str(catalog_path):
-            print('Restart Codex to reload the model picker.')
+            reload_picker(home, args.timeout, args.no_daemon_restart)
         else:
             print('Use install to configure Codex, or set model_catalog_json to this file.')
 

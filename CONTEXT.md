@@ -5,6 +5,11 @@ Codex, including models that Codex does not already know about.
 
 ## Language
 
+**App-server daemon**:
+Codex's shared background server for interactive sessions. A TUI asks it for the
+picker catalog, and the daemon keeps that catalog in memory, so catalog changes
+are invisible until the daemon restarts.
+
 **Selected connection**:
 The provider, endpoint, and authentication selected by a Codex configuration and
 any explicit profile or invocation overrides. It is not necessarily the connection

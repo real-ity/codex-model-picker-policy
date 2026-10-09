@@ -59,6 +59,8 @@ class ProxyTests(unittest.TestCase):
                     'PATH': f'{ROOT / "tests/bin"}:{os.environ["PATH"]}',
                     'CODEX_POLICY_TEST_ROOT': str(ROOT)}
         self.env.pop('CODEX_POLICY_REQUIRE_UNPINNED', None)
+        for key in ('CODEX_POLICY_DAEMON_STATUS', 'CODEX_POLICY_DAEMON_LOG', 'CODEX_POLICY_DAEMON_RESTART_FAILS'):
+            self.env.pop(key, None)
         self.models = [
             {'slug': 'coding-alias', 'display_name': 'Coding alias', 'visibility': 'hide',
              'context_window': 123456, 'input_modalities': ['text', 'image'],
@@ -137,6 +139,42 @@ class ProxyTests(unittest.TestCase):
         self.assertIn('Restart Codex', result.stdout)
         self.invoke('remove')
         self.assertEqual(list(self.home.glob('models_cache.json.bak.*')), backups)
+
+    def test_install_restarts_running_app_server_daemon(self):
+        log = self.home / 'daemon-restarts.log'
+        self.env['CODEX_POLICY_DAEMON_STATUS'] = 'running'
+        self.env['CODEX_POLICY_DAEMON_LOG'] = str(log)
+        result = self.invoke('install')
+        self.assertIn('Restarted the local app-server daemon', result.stdout)
+        self.assertEqual(log.read_text(), 'restart\n')
+
+    def test_no_daemon_restart_leaves_running_daemon_alone(self):
+        log = self.home / 'daemon-restarts.log'
+        self.env['CODEX_POLICY_DAEMON_STATUS'] = 'running'
+        self.env['CODEX_POLICY_DAEMON_LOG'] = str(log)
+        result = self.invoke('install', '--no-daemon-restart')
+        self.assertIn('Restart Codex', result.stdout)
+        self.assertFalse(log.exists())
+
+    def test_stopped_daemon_keeps_restart_instruction(self):
+        self.env['CODEX_POLICY_DAEMON_STATUS'] = 'stopped'
+        result = self.invoke('install')
+        self.assertIn('Restart Codex', result.stdout)
+
+    def test_daemon_restart_failure_is_reported_without_failing_install(self):
+        self.env['CODEX_POLICY_DAEMON_STATUS'] = 'running'
+        self.env['CODEX_POLICY_DAEMON_RESTART_FAILS'] = '1'
+        result = self.invoke('install')
+        self.assertIn('Could not restart the local app-server daemon', result.stderr)
+
+    def test_reset_and_remove_restart_running_daemon(self):
+        log = self.home / 'daemon-restarts.log'
+        self.env['CODEX_POLICY_DAEMON_STATUS'] = 'running'
+        self.env['CODEX_POLICY_DAEMON_LOG'] = str(log)
+        self.invoke('install', '--no-daemon-restart')
+        self.invoke('reset')
+        self.invoke('remove')
+        self.assertEqual(log.read_text(), 'restart\nrestart\n')
 
     def test_reset_restores_bundled_models_and_preserves_provider(self):
         self.config.write_text('model_reasoning_effort = "low"\n' + self.config.read_text())
